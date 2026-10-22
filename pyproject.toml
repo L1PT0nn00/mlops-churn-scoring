@@ -1,5 +1,5 @@
 [project]
-name = "mlops"
+name = "mlops-churn-scoring"
 version = "0.1.0"
 description = "Скоринг оттока клиентов: CatBoost, FastAPI, Airflow, MLflow, Kubernetes, Prometheus"
 requires-python = ">=3.9"
