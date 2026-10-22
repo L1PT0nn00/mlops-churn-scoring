@@ -1,0 +1,19 @@
+[project]
+name = "churn-mlops"
+version = "0.1.0"
+description = "Скоринг оттока клиентов: CatBoost, FastAPI, Airflow, MLflow, Kubernetes, Prometheus"
+requires-python = ">=3.9"
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["UP006", "UP007", "UP035", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]

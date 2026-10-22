@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: churn-api
+  namespace: churn
+  labels: { app: churn-api }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5          # сколько версий хранить для kubectl rollout undo
+  selector:
+    matchLabels: { app: churn-api }
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0            # не убирать старый под, пока новый не Ready
+      maxSurge: 1
+  template:
+    metadata:
+      labels: { app: churn-api }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: /metrics
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, runAsNonRoot: true }
+      topologySpreadConstraints:   # разносим реплики по разным нодам
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: churn-api }
+      containers:
+        - name: api
+          image: churn-mlops:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8000 }]
+          envFrom: [{ configMapRef: { name: churn-config } }]
+          resources:
+            requests: { cpu: "250m", memory: 512Mi }
+            limits: { cpu: "1", memory: 1Gi }
+          startupProbe:              # даёт время загрузить модель, liveness пока молчит
+            httpGet: { path: /health, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:            # трафик только когда модель загружена
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:             # процесс завис -> перезапуск
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:                 # пауза, пока под убирают из Service, чтобы не терять запросы
+              exec: { command: ["sleep", "5"] }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: models, mountPath: /models, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: churn-models }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: churn-api
+  namespace: churn
+spec:
+  selector: { app: churn-api }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: churn-api
+  namespace: churn
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: churn-api }
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: churn-api
+  namespace: churn
+spec:
+  minAvailable: 1                  # при обслуживании нод хотя бы один под остаётся
+  selector:
+    matchLabels: { app: churn-api }

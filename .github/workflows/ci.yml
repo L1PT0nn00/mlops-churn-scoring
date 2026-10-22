@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install
+        run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Tests (данные, ворота качества, API, дрейф)
+        run: pytest
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: churn-mlops:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test (контейнер стартует, модель обучается, /predict отвечает)
+        run: |
+          docker volume create models
+          docker run --rm -e CHURN_TRAIN_ITERATIONS=100 -v models:/models churn-mlops:ci python -m churn.pipeline bootstrap
+          docker run -d --name api -p 8000:8000 -v models:/models:ro churn-mlops:ci
+          for i in $(seq 1 30); do curl -sf localhost:8000/ready && break; sleep 2; done
+          curl -sf -X POST localhost:8000/predict -H 'Content-Type: application/json' -d @scripts/sample_customer.json
+          docker stop api   # проверка graceful shutdown: контейнер должен завершиться по SIGTERM
+          docker logs api | grep -q "service stopping"
+      - name: Push to GHCR (только main)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          IMAGE=ghcr.io/$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')/churn-mlops
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag churn-mlops:ci "$IMAGE:${GITHUB_SHA::7}"
+          docker push "$IMAGE:${GITHUB_SHA::7}"

@@ -1,0 +1,10 @@
+catboost==1.2.7
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.5.2
+fastapi==0.115.6
+uvicorn==0.32.1
+pydantic==2.10.4
+pydantic-settings==2.7.0
+prometheus-client==0.21.1
+mlflow-skinny==2.18.0

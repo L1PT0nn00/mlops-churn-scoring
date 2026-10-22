@@ -1,0 +1,182 @@
+# Локальный стенд: docker compose up -d --build
+# Airflow тяжёлый, он в профиле: docker compose --profile airflow up -d --build
+
+x-churn-env: &churn-env
+  CHURN_DATA_DIR: /data
+  CHURN_MODEL_DIR: /models
+  CHURN_MODEL_RELOAD_SECONDS: "15"
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+
+x-s3-env: &s3-env
+  MLFLOW_S3_ENDPOINT_URL: http://s3:8333
+  AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-mlops}
+  AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-change-me-local}
+  AWS_DEFAULT_REGION: us-east-1
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-mlops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-local}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-mlops}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # S3-совместимое хранилище артефактов (в проде MinIO или Ceph: API тот же, код не меняется)
+  s3:
+    image: chrislusf/seaweedfs:3.80
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cat > /tmp/s3.json <<EOF
+        {"identities":[{"name":"mlops","credentials":[{"accessKey":"$${S3_ACCESS_KEY}","secretKey":"$${S3_SECRET_KEY}"}],"actions":["Admin","Read","Write","List","Tagging"]}]}
+        EOF
+        exec weed server -dir=/data -s3 -s3.port=8333 -s3.config=/tmp/s3.json -volume.max=0
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-mlops}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-change-me-local}
+    ports:
+      - "8333:8333"   # S3 API
+      - "8888:8888"   # веб-интерфейс файлов
+    volumes:
+      - s3data:/data
+    restart: unless-stopped
+
+  s3-init:
+    build: { context: ., dockerfile: docker/mlflow.Dockerfile }
+    image: churn-mlflow:${TAG:-0.1.0}
+    environment: *s3-env
+    command:
+      - python
+      - -c
+      - |
+        import os, time, boto3
+        s3 = boto3.client("s3", endpoint_url=os.environ["MLFLOW_S3_ENDPOINT_URL"])
+        for attempt in range(60):  # ждём, пока хранилище поднимется
+            try:
+                if "mlflow" not in [b["Name"] for b in s3.list_buckets().get("Buckets", [])]:
+                    s3.create_bucket(Bucket="mlflow")
+                print("bucket mlflow ready")
+                break
+            except Exception as e:
+                print("waiting for s3:", type(e).__name__)
+                time.sleep(2)
+        else:
+            raise SystemExit("s3 is not available")
+    depends_on: [s3]
+    restart: "no"
+
+  mlflow:
+    build: { context: ., dockerfile: docker/mlflow.Dockerfile }
+    image: churn-mlflow:${TAG:-0.1.0}
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri postgresql://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-change-me-local}@postgres:5432/mlflow
+      --artifacts-destination s3://mlflow
+    environment: *s3-env
+    ports:
+      - "5001:5000"   # 5000 на macOS занят AirPlay
+    depends_on:
+      postgres: { condition: service_healthy }
+      s3-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  # Разовая задача: данные и первая модель, если их ещё нет (в k8s это Job)
+  trainer:
+    build: .
+    image: churn-mlops:${TAG:-0.1.0}
+    command: ["python", "-m", "churn.pipeline", "bootstrap"]
+    environment: *churn-env
+    volumes:
+      - churn-data:/data
+      - churn-models:/models
+    depends_on:
+      mlflow: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    build: .
+    image: churn-mlops:${TAG:-0.1.0}
+    environment: *churn-env
+    ports:
+      - "8000:8000"
+    volumes:
+      - churn-models:/models:ro
+    depends_on:
+      trainer: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-local}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/churn.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    restart: unless-stopped
+
+  airflow:
+    profiles: ["airflow"]
+    build: { context: ., dockerfile: docker/airflow.Dockerfile }
+    image: churn-airflow:${TAG:-0.1.0}
+    command: standalone
+    user: "10001:0"   # тот же uid, что у trainer и api: общие тома с моделями и данными
+    environment:
+      <<: *churn-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-mlops}:${POSTGRES_PASSWORD:-change-me-local}@postgres:5432/airflow
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags:ro
+      - churn-data:/data
+      - churn-models:/models
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres: { condition: service_healthy }
+      trainer: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  s3data:
+  grafanadata:
+  churn-data:
+  churn-models:

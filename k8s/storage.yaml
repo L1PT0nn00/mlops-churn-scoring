@@ -1,0 +1,12 @@
+# Общий диск для моделей. ReadWriteOnce подходит для одной ноды (Docker Desktop, kind).
+# В многонодовом кластере: ReadWriteMany (NFS/CephFS) или модели из MinIO / MLflow.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: churn-models
+  namespace: churn
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi

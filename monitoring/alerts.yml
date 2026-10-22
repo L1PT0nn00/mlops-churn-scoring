@@ -1,0 +1,54 @@
+# Три уровня: инфраструктура, сервис, модель.
+# В проде алерты уходят в Alertmanager -> Telegram/почта дежурному.
+groups:
+  - name: churn-service
+    rules:
+      - alert: ChurnApiDown
+        expr: up{job="churn-api"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "Сервис скоринга недоступен"
+
+      - alert: ChurnModelNotLoaded
+        expr: churn_model_loaded == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Сервис жив, но модель не загружена (readiness не проходит)"
+
+      - alert: ChurnHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="churn-api",status=~"5.."}[5m]))
+            / clamp_min(sum(rate(http_requests_total{job="churn-api"}[5m])), 1e-9) > 0.05
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Больше 5% ответов с ошибкой 5xx"
+
+      - alert: ChurnHighLatencyP95
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{path="/predict"}[5m]))) > 0.3
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "p95 времени ответа /predict выше 300 мс"
+
+  - name: churn-model
+    rules:
+      - alert: ChurnFeatureDrift
+        expr: max by (feature) (churn_feature_psi) > 0.2
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Дрейф признака {{ $labels.feature }}: PSI {{ $value | printf \"%.2f\" }}"
+          description: "Сначала проверить источник данных; если данные корректны, запустить переобучение."
+
+      - alert: ChurnPredictionShift
+        expr: |
+          (sum(rate(churn_probability_sum[1h])) / clamp_min(sum(rate(churn_probability_count[1h])), 1e-9))
+            > 1.5 * (sum(rate(churn_probability_sum[1h] offset 1d)) / clamp_min(sum(rate(churn_probability_count[1h] offset 1d)), 1e-9))
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "Средняя вероятность оттока выросла в 1.5 раза к вчерашнему дню"

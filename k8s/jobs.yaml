@@ -1,0 +1,69 @@
+# Первая модель при установке + ночное переобучение без Airflow (запасной вариант).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: churn-bootstrap
+  namespace: churn
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels: { app: churn-trainer }
+    spec:
+      restartPolicy: Never
+      securityContext: { runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, runAsNonRoot: true }
+      containers:
+        - name: trainer
+          image: churn-mlops:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "churn.pipeline", "bootstrap"]
+          envFrom: [{ configMapRef: { name: churn-config } }]
+          resources:
+            requests: { cpu: "500m", memory: 1Gi }
+            limits: { cpu: "2", memory: 2Gi }
+          volumeMounts:
+            - { name: models, mountPath: /models }
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: churn-models }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: churn-retrain
+  namespace: churn
+spec:
+  schedule: "0 3 * * *"
+  concurrencyPolicy: Forbid      # не запускать второе обучение, пока идёт первое
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels: { app: churn-trainer }
+        spec:
+          restartPolicy: Never
+          securityContext: { runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, runAsNonRoot: true }
+          containers:
+            - name: trainer
+              image: churn-mlops:0.1.0
+              imagePullPolicy: IfNotPresent
+              command: ["sh", "-c", "python -m churn.pipeline generate && exec python -m churn.pipeline retrain"]
+              envFrom: [{ configMapRef: { name: churn-config } }]
+              resources:
+                requests: { cpu: "500m", memory: 1Gi }
+                limits: { cpu: "2", memory: 2Gi }
+              volumeMounts:
+                - { name: models, mountPath: /models }
+                - { name: data, mountPath: /data }
+          volumes:
+            - name: models
+              persistentVolumeClaim: { claimName: churn-models }
+            - name: data
+              emptyDir: {}

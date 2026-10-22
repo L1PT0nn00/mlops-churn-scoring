@@ -1,0 +1,12 @@
+{
+  "customer_id": "C42-0000001",
+  "tenure_months": 3,
+  "monthly_charges": 89.5,
+  "total_charges": 268.5,
+  "support_calls_90d": 4,
+  "num_products": 1,
+  "age": 27,
+  "contract": "month-to-month",
+  "payment_method": "cash",
+  "internet_service": "fiber"
+}
