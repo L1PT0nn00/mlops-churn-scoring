@@ -15,5 +15,6 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
